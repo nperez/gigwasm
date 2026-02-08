@@ -919,6 +919,32 @@ func detectABI(module *wasmer.Module) ABI {
 	return ABITinyGo
 }
 
+// CompiledModule holds a pre-compiled WASM module serialized as native code.
+// Creating instances from a CompiledModule is much faster than compiling from
+// WASM bytes each time.
+type CompiledModule struct {
+	serialized []byte
+	abi        ABI
+}
+
+// CompileModule compiles WASM bytes into a reusable CompiledModule.
+// The compilation is done once; subsequent NewInstanceFromModule calls
+// deserialize the native code, which is significantly faster.
+func CompileModule(b []byte) (*CompiledModule, error) {
+	engine := wasmer.NewEngine()
+	store := wasmer.NewStore(engine)
+	module, err := wasmer.NewModule(store, b)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile module: %w", err)
+	}
+	abi := detectABI(module)
+	serialized, err := module.Serialize()
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize module: %w", err)
+	}
+	return &CompiledModule{serialized: serialized, abi: abi}, nil
+}
+
 // NewInstance creates an instance of GoRuntime from WASM bytes.
 // It auto-detects whether the module was compiled with standard Go or TinyGo.
 func NewInstance(b []byte, opts ...InstanceOption) (*GoInstance, error) {
@@ -934,6 +960,29 @@ func NewInstance(b []byte, opts ...InstanceOption) (*GoInstance, error) {
 		return nil, fmt.Errorf("failed to compile module: %w", err)
 	}
 
+	return newInstanceFromModule(store, module, detectABI(module), cfg)
+}
+
+// NewInstanceFromModule creates an instance from a pre-compiled module.
+// This deserializes native code instead of recompiling WASM, which is
+// significantly faster when creating many instances from the same module.
+func NewInstanceFromModule(cm *CompiledModule, opts ...InstanceOption) (*GoInstance, error) {
+	cfg := &instanceConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	engine := wasmer.NewEngine()
+	store := wasmer.NewStore(engine)
+	module, err := wasmer.DeserializeModule(store, cm.serialized)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize module: %w", err)
+	}
+
+	return newInstanceFromModule(store, module, cm.abi, cfg)
+}
+
+func newInstanceFromModule(store *wasmer.Store, module *wasmer.Module, abi ABI, cfg *instanceConfig) (*GoInstance, error) {
 	data := &GoInstance{}
 	data.initTimers()
 	data.initValues()
@@ -944,7 +993,7 @@ func NewInstance(b []byte, opts ...InstanceOption) (*GoInstance, error) {
 		mod(globals)
 	}
 
-	data.abi = detectABI(module)
+	data.abi = abi
 
 	importObject := wasmer.NewImportObject()
 

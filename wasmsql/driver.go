@@ -276,7 +276,13 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 		return nil, err
 	}
 
-	// Read column names
+	// Step first to trigger query execution on the host, which
+	// populates column metadata. Before this, column_count returns 0.
+	rc := hostStep(s.handle)
+	if rc != sqliteRow && rc != sqliteDone {
+		return nil, fmt.Errorf("wasmsql: query step failed: %s", getErrmsg(s.conn.db))
+	}
+
 	numCols := hostColumnCount(s.handle)
 	cols := make([]string, numCols)
 	buf := make([]byte, 256)
@@ -285,7 +291,8 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 		cols[i] = string(buf[:n])
 	}
 
-	return &Rows{stmt: s, cols: cols, numCols: numCols}, nil
+	done := rc == sqliteDone
+	return &Rows{stmt: s, cols: cols, numCols: numCols, done: done, firstStep: rc}, nil
 }
 
 // --- Result ---
@@ -306,10 +313,11 @@ func (r *Result) RowsAffected() (int64, error) {
 // --- Rows ---
 
 type Rows struct {
-	stmt    *Stmt
-	cols    []string
-	numCols int32
-	done    bool
+	stmt      *Stmt
+	cols      []string
+	numCols   int32
+	done      bool
+	firstStep int32 // buffered step result from Query(); -1 = consumed
 }
 
 func (r *Rows) Columns() []string {
@@ -333,7 +341,14 @@ func (r *Rows) Next(dest []driver.Value) error {
 		return io.EOF
 	}
 
-	rc := hostStep(r.stmt.handle)
+	var rc int32
+	if r.firstStep >= 0 {
+		rc = r.firstStep
+		r.firstStep = -1
+	} else {
+		rc = hostStep(r.stmt.handle)
+	}
+
 	if rc == sqliteDone {
 		r.done = true
 		return io.EOF
