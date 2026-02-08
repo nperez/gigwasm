@@ -51,8 +51,8 @@ gigwasm implements all 25 functions in the `gojs` import namespace that Go's `wa
 | `runtime.resetMemoryDataView` | Supported | No-op (wasmer doesn't change buffer identity) |
 | `runtime.nanotime1` | Supported | |
 | `runtime.walltime` | Supported | |
-| `runtime.scheduleTimeoutEvent` | Stub | No-op; no async event loop |
-| `runtime.clearTimeoutEvent` | Stub | No-op |
+| `runtime.scheduleTimeoutEvent` | Supported | Spawns timer goroutine; event loop calls `resume` |
+| `runtime.clearTimeoutEvent` | Supported | Cancels pending timer |
 | `runtime.getRandomData` | Supported | Uses `crypto/rand` |
 
 #### syscall/js interop
@@ -84,8 +84,8 @@ gigwasm implements all 18 functions in the `gojs` module and all 6 WASI function
 
 | Function | Status | Notes |
 |---|---|---|
-| `runtime.ticks` | Supported | Millisecond-precision float64 |
-| `runtime.sleepTicks` | Supported | Calls `go_scheduler` export after sleep |
+| `runtime.ticks` | Supported | Nanosecond-precision int64 (TinyGo 0.40+) |
+| `runtime.sleepTicks` | Supported | Async; event loop calls `go_scheduler` after delay |
 | `syscall/js.finalizeRef` | Supported | No-op (TinyGo doesn't use ref-counted GC) |
 | `syscall/js.stringVal` | Supported | |
 | `syscall/js.valueGet` | Supported | |
@@ -130,6 +130,10 @@ The global object (value slot 5) simulates the browser/Node.js environment that 
 | `fs.read` | Supported | stdin with callback |
 | `fs.fstat` | Supported | Returns device type (char device vs pipe) |
 | `fs.constants` | Supported | `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_EXCL` |
+| `setTimeout` | Supported | Callback timers with event loop |
+| `clearTimeout` | Supported | Cancels pending callback timer |
+| `setInterval` | Supported | Repeating callback timers |
+| `clearInterval` | Supported | Cancels pending interval timer |
 | `fs.*` (other) | Stubs | 15 filesystem ops return nil (chmod, mkdir, open, stat, etc.) |
 | `process` | Partial | Empty map; missing `getuid`, `getgid`, `umask`, `cwd`, `chdir`, `env`, `argv` |
 | `performance` | Not provided | Go uses `runtime.nanotime1` internally, but user code accessing `performance` via `syscall/js` won't find it |
@@ -177,12 +181,13 @@ Provides a `sqlite3` import namespace backed by `modernc.org/sqlite`, paired wit
 - **Exporting Go functions** to the host via the global object
 - **`crypto/rand`**
 - **`time.Now()`** and monotonic clocks
+- **`time.Sleep`**, **`time.After`**, and goroutine scheduling across timer callbacks (both standard Go and TinyGo)
+- **`setTimeout`** / **`setInterval`** via `syscall/js`
 - **`net/http`** client requests (with `WithFetch()`)
 - **`database/sql`** with SQLite (with `SQLiteNamespace()` + `wasmsql` driver)
 
 ## Known Limitations
 
-- **No async event loop** -- `scheduleTimeoutEvent` and `clearTimeoutEvent` are no-ops. Code relying on `time.Sleep`, `time.After`, or goroutine scheduling across JS callbacks won't work as expected.
 - **`valueInstanceOf` always returns false** -- no type hierarchy tracking.
 - **No real filesystem** -- most `fs` operations are stubs. Only stdin/stdout/stderr are functional.
 - **No DOM or browser APIs** -- this is a server-side/CLI runtime.
