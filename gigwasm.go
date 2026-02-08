@@ -1,6 +1,7 @@
 package gigwasm
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sync"
+	"time"
 
 	"github.com/wasmerio/wasmer-go/wasmer"
 )
@@ -59,6 +62,16 @@ func withGlobalModifier(fn func(map[string]interface{})) InstanceOption {
 	}
 }
 
+// timerEntry represents a pending timer (runtime or callback).
+type timerEntry struct {
+	id       int32
+	cancel   context.CancelFunc
+	callback func([]interface{}) interface{} // nil for runtime-level timers
+	cbArgs   []interface{}
+	interval bool
+	delayMs  float64
+}
+
 // GoInstance is instance of Go Runtime.
 type GoInstance struct {
 	inst        *wasmer.Instance
@@ -72,6 +85,11 @@ type GoInstance struct {
 	exited      bool
 	exitCode    int
 	abi         ABI
+
+	timerMu         sync.Mutex
+	nextTimerID     int32
+	scheduledTimers map[int32]*timerEntry
+	timerCh         chan int32
 }
 
 // Get returns a Go value specified by name from the global object.
@@ -237,6 +255,8 @@ func (d *GoInstance) boxValue(v interface{}) uint64 {
 		}
 		return math.Float64bits(t)
 	case nil:
+		return (uint64(nanHead) << 32) | 2
+	case jsNull:
 		return (uint64(nanHead) << 32) | 2
 	case bool:
 		if t {
@@ -456,11 +476,11 @@ func (d *GoInstance) reflectNew(v interface{}, args []interface{}) (interface{},
 
 func (d *GoInstance) initValues() {
 	d.values = []interface{}{
-		nil,   // 0: NaN
-		0.0,   // 1: 0
-		nil,   // 2: null
-		true,  // 3: true
-		false, // 4: false
+		nil,    // 0: NaN/undefined
+		0.0,    // 1: 0
+		JSNull, // 2: null (distinct from undefined/nil)
+		true,   // 3: true
+		false,  // 4: false
 		// 5: global object
 		map[string]interface{}{
 			"console": map[string]interface{}{
@@ -503,6 +523,78 @@ func (d *GoInstance) initValues() {
 				},
 			},
 			"process": map[string]interface{}{},
+			"setTimeout": func(args []interface{}) interface{} {
+				if len(args) < 1 {
+					return nil
+				}
+				cb, ok := args[0].(func([]interface{}) interface{})
+				if !ok {
+					return nil
+				}
+				delayMs := 0.0
+				if len(args) > 1 {
+					if v, ok := args[1].(float64); ok {
+						delayMs = v
+					}
+				}
+				var cbArgs []interface{}
+				if len(args) > 2 {
+					cbArgs = args[2:]
+				}
+				return d.scheduleCallbackTimer(delayMs, cb, cbArgs, false)
+			},
+			"clearTimeout": func(args []interface{}) interface{} {
+				if len(args) < 1 {
+					return nil
+				}
+				id, ok := args[0].(float64)
+				if !ok {
+					return nil
+				}
+				d.timerMu.Lock()
+				if entry, exists := d.scheduledTimers[int32(id)]; exists {
+					entry.cancel()
+					delete(d.scheduledTimers, int32(id))
+				}
+				d.timerMu.Unlock()
+				return nil
+			},
+			"setInterval": func(args []interface{}) interface{} {
+				if len(args) < 1 {
+					return nil
+				}
+				cb, ok := args[0].(func([]interface{}) interface{})
+				if !ok {
+					return nil
+				}
+				delayMs := 0.0
+				if len(args) > 1 {
+					if v, ok := args[1].(float64); ok {
+						delayMs = v
+					}
+				}
+				var cbArgs []interface{}
+				if len(args) > 2 {
+					cbArgs = args[2:]
+				}
+				return d.scheduleCallbackTimer(delayMs, cb, cbArgs, true)
+			},
+			"clearInterval": func(args []interface{}) interface{} {
+				if len(args) < 1 {
+					return nil
+				}
+				id, ok := args[0].(float64)
+				if !ok {
+					return nil
+				}
+				d.timerMu.Lock()
+				if entry, exists := d.scheduledTimers[int32(id)]; exists {
+					entry.cancel()
+					delete(d.scheduledTimers, int32(id))
+				}
+				d.timerMu.Unlock()
+				return nil
+			},
 			"fs": map[string]interface{}{
 				"constants": map[string]interface{}{
 					"O_WRONLY": float64(-1),
@@ -659,7 +751,7 @@ func (d *GoInstance) initValues() {
 	}
 
 	goObj := map[string]interface{}{
-		"_pendingEvent": nil,
+		"_pendingEvent": JSNull,
 	}
 	d.values[6] = goObj
 
@@ -688,6 +780,135 @@ func (d *GoInstance) initValues() {
 	d.exited = false
 }
 
+// initTimers initializes the timer infrastructure.
+func (d *GoInstance) initTimers() {
+	d.nextTimerID = 1
+	d.scheduledTimers = make(map[int32]*timerEntry)
+	d.timerCh = make(chan int32, 64)
+}
+
+// scheduleCallbackTimer creates a callback timer (setTimeout or setInterval).
+// Returns the timer ID.
+func (d *GoInstance) scheduleCallbackTimer(delayMs float64, callback func([]interface{}) interface{}, cbArgs []interface{}, interval bool) float64 {
+	d.timerMu.Lock()
+	id := d.nextTimerID
+	d.nextTimerID++
+	ctx, cancel := context.WithCancel(context.Background())
+	entry := &timerEntry{
+		id:       id,
+		cancel:   cancel,
+		callback: callback,
+		cbArgs:   cbArgs,
+		interval: interval,
+		delayMs:  delayMs,
+	}
+	d.scheduledTimers[id] = entry
+	d.timerMu.Unlock()
+
+	go d.timerGoroutine(id, delayMs, ctx)
+	return float64(id)
+}
+
+// timerGoroutine sleeps for the given delay and then sends the timer ID on timerCh.
+func (d *GoInstance) timerGoroutine(id int32, delayMs float64, ctx context.Context) {
+	dur := time.Duration(delayMs * float64(time.Millisecond))
+	select {
+	case <-time.After(dur):
+		d.timerCh <- id
+	case <-ctx.Done():
+		// Timer was cancelled
+	}
+}
+
+// runEventLoop processes timer events after run() returns.
+// It runs on the goroutine that called NewInstance, ensuring all WASM
+// access is single-threaded.
+func (d *GoInstance) runEventLoop() {
+	for {
+		if d.exited {
+			d.cancelAllTimers()
+			return
+		}
+
+		d.timerMu.Lock()
+		count := len(d.scheduledTimers)
+		d.timerMu.Unlock()
+
+		if count == 0 {
+			return
+		}
+
+		id := <-d.timerCh
+
+		if d.exited {
+			d.cancelAllTimers()
+			return
+		}
+
+		d.timerMu.Lock()
+		entry, ok := d.scheduledTimers[id]
+		if !ok {
+			// Timer was cancelled between firing and processing
+			d.timerMu.Unlock()
+			continue
+		}
+
+		if entry.callback != nil {
+			// Path B: callback timer (setTimeout/setInterval)
+			cb := entry.callback
+			args := entry.cbArgs
+			isInterval := entry.interval
+			delay := entry.delayMs
+
+			if isInterval {
+				// Re-schedule for the next interval
+				ctx, cancel := context.WithCancel(context.Background())
+				entry.cancel = cancel
+				go d.timerGoroutine(id, delay, ctx)
+			} else {
+				delete(d.scheduledTimers, id)
+			}
+			d.timerMu.Unlock()
+
+			// Invoke the callback — for _makeFuncWrapper callbacks,
+			// this sets _pendingEvent and calls resume() internally.
+			cb(args)
+		} else {
+			// Path A: runtime timer (scheduleTimeoutEvent)
+			delete(d.scheduledTimers, id)
+			d.timerMu.Unlock()
+
+			// Call resume() directly — Go runtime's handleEvent will see
+			// no _pendingEvent and run checkTimeouts().
+			if d.resume != nil {
+				_, err := d.resume()
+				if err != nil {
+					log.Print("resume error (timer): ", err)
+				}
+			}
+		}
+	}
+}
+
+// cancelAllTimers cancels all pending timers and drains the channel.
+func (d *GoInstance) cancelAllTimers() {
+	d.timerMu.Lock()
+	for _, entry := range d.scheduledTimers {
+		entry.cancel()
+	}
+	d.scheduledTimers = make(map[int32]*timerEntry)
+	d.timerMu.Unlock()
+
+	// Drain any remaining events from the channel
+	for {
+		select {
+		case <-d.timerCh:
+		default:
+			return
+		}
+	}
+}
+
 // detectABI inspects module exports to determine the ABI type.
 func detectABI(module *wasmer.Module) ABI {
 	for _, exp := range module.Exports() {
@@ -714,6 +935,7 @@ func NewInstance(b []byte, opts ...InstanceOption) (*GoInstance, error) {
 	}
 
 	data := &GoInstance{}
+	data.initTimers()
 	data.initValues()
 
 	// Apply global modifiers (e.g. WithFetch installs fetch API)
@@ -816,6 +1038,8 @@ func (d *GoInstance) initStdGo(cfg *instanceConfig) (*GoInstance, error) {
 		return nil, fmt.Errorf("failed to call 'run': %w", err)
 	}
 
+	d.runEventLoop()
+
 	return d, nil
 }
 
@@ -843,7 +1067,54 @@ func (d *GoInstance) initTinyGo() (*GoInstance, error) {
 		return nil, fmt.Errorf("failed to call '_start': %w", err)
 	}
 
+	d.runTinyGoEventLoop()
+
 	return d, nil
+}
+
+// runTinyGoEventLoop processes timer events for TinyGo after _start returns.
+// Similar to runEventLoop but calls go_scheduler instead of resume.
+func (d *GoInstance) runTinyGoEventLoop() {
+	goScheduler, err := d.inst.Exports.GetFunction("go_scheduler")
+	if err != nil || goScheduler == nil {
+		return
+	}
+
+	for {
+		if d.exited {
+			d.cancelAllTimers()
+			return
+		}
+
+		d.timerMu.Lock()
+		count := len(d.scheduledTimers)
+		d.timerMu.Unlock()
+
+		if count == 0 {
+			return
+		}
+
+		id := <-d.timerCh
+
+		if d.exited {
+			d.cancelAllTimers()
+			return
+		}
+
+		d.timerMu.Lock()
+		_, ok := d.scheduledTimers[id]
+		if !ok {
+			d.timerMu.Unlock()
+			continue
+		}
+		delete(d.scheduledTimers, id)
+		d.timerMu.Unlock()
+
+		_, err := goScheduler()
+		if err != nil {
+			log.Print("go_scheduler error: ", err)
+		}
+	}
 }
 
 // CompileGo compiles Go source in srcDir to a WASM binary using the standard Go compiler.

@@ -2,6 +2,7 @@ package gigwasm
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -18,30 +19,38 @@ func tinyGoRuntime(store *wasmer.Store, data *GoInstance) map[string]wasmer.Into
 	timeOrigin := time.Now()
 
 	return map[string]wasmer.IntoExtern{
-		// func runtime.ticks() float64
+		// func runtime.ticks() int64 — nanoseconds since program start
 		"runtime.ticks": wasmer.NewFunction(
 			store,
-			wasmer.NewFunctionType(wasmer.NewValueTypes(), wasmer.NewValueTypes(wasmer.F64)),
+			wasmer.NewFunctionType(wasmer.NewValueTypes(), wasmer.NewValueTypes(wasmer.I64)),
 			func(args []wasmer.Value) ([]wasmer.Value, error) {
 				elapsed := time.Since(timeOrigin)
-				ms := float64(elapsed.Nanoseconds()) / 1e6
-				return []wasmer.Value{wasmer.NewF64(ms)}, nil
+				return []wasmer.Value{wasmer.NewI64(elapsed.Nanoseconds())}, nil
 			},
 		),
 
-		// func runtime.sleepTicks(timeout float64)
+		// func runtime.sleepTicks(timeout int64) — nanoseconds
+		// Returns immediately; spawns a goroutine that sends on timerCh
+		// after sleeping. The event loop in initTinyGo calls go_scheduler.
 		"runtime.sleepTicks": wasmer.NewFunction(
 			store,
-			wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.F64), wasmer.NewValueTypes()),
+			wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I64), wasmer.NewValueTypes()),
 			func(args []wasmer.Value) ([]wasmer.Value, error) {
-				timeout := args[0].F64()
-				go func() {
-					time.Sleep(time.Duration(timeout) * time.Millisecond)
-					fn, err := data.inst.Exports.GetFunction("go_scheduler")
-					if err == nil && fn != nil {
-						fn()
-					}
-				}()
+				ns := args[0].I64()
+
+				data.timerMu.Lock()
+				id := data.nextTimerID
+				data.nextTimerID++
+				ctx, cancel := context.WithCancel(context.Background())
+				entry := &timerEntry{
+					id:     id,
+					cancel: cancel,
+					// callback nil = runtime timer
+				}
+				data.scheduledTimers[id] = entry
+				data.timerMu.Unlock()
+
+				go data.timerGoroutine(id, float64(ns)/1e6, ctx)
 				return []wasmer.Value{}, nil
 			},
 		),

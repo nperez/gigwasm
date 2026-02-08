@@ -1,6 +1,7 @@
 package gigwasm
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"os"
@@ -77,14 +78,39 @@ func stdGoRuntime(store *wasmer.Store, data *GoInstance) map[string]wasmer.IntoE
 
 		"runtime.scheduleTimeoutEvent": wasmer.NewFunction(store, spType,
 			func(args []wasmer.Value) ([]wasmer.Value, error) {
-				// no-op: we don't implement async scheduling
+				sp := args[0].I32()
+				delayMs := data.getInt64(sp + 8)
+
+				data.timerMu.Lock()
+				id := data.nextTimerID
+				data.nextTimerID++
+				ctx, cancel := context.WithCancel(context.Background())
+				entry := &timerEntry{
+					id:     id,
+					cancel: cancel,
+					// callback nil = runtime timer (Path A)
+				}
+				data.scheduledTimers[id] = entry
+				data.timerMu.Unlock()
+
+				go data.timerGoroutine(id, float64(delayMs), ctx)
+
+				data.setInt64(sp+16, int64(id))
 				return []wasmer.Value{}, nil
 			},
 		),
 
 		"runtime.clearTimeoutEvent": wasmer.NewFunction(store, spType,
 			func(args []wasmer.Value) ([]wasmer.Value, error) {
-				// no-op
+				sp := args[0].I32()
+				id := int32(data.getInt64(sp + 8))
+
+				data.timerMu.Lock()
+				if entry, exists := data.scheduledTimers[id]; exists {
+					entry.cancel()
+					delete(data.scheduledTimers, id)
+				}
+				data.timerMu.Unlock()
 				return []wasmer.Value{}, nil
 			},
 		),

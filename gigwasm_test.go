@@ -110,6 +110,74 @@ func TestCompileAndRunTinyGo(t *testing.T) {
 	t.Logf("Add(2, 3) = %v", fResult)
 }
 
+func TestTimerEventLoop(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go compiler not found in PATH")
+	}
+
+	wasmBytes, err := CompileGo("./testdata/stdgo_timer")
+	if err != nil {
+		t.Fatalf("CompileGo failed: %v", err)
+	}
+
+	inst, err := NewInstance(wasmBytes)
+	if err != nil {
+		t.Fatalf("NewInstance failed: %v", err)
+	}
+
+	done := inst.Get("TimerDone")
+	if done == nil || done != true {
+		t.Fatalf("TimerDone = %v, want true", done)
+	}
+
+	elapsed := inst.Get("TimerElapsedMs")
+	if elapsed == nil {
+		t.Fatal("TimerElapsedMs not set")
+	}
+	ms, ok := elapsed.(float64)
+	if !ok {
+		t.Fatalf("TimerElapsedMs is %T, want float64", elapsed)
+	}
+	if ms < 40 {
+		t.Fatalf("TimerElapsedMs = %v, want >= 40 (slept 50ms)", ms)
+	}
+	t.Logf("Timer test: elapsed=%vms", ms)
+}
+
+func TestTinyGoTimerEventLoop(t *testing.T) {
+	if _, err := exec.LookPath("tinygo"); err != nil {
+		t.Skip("tinygo compiler not found in PATH")
+	}
+
+	wasmBytes, err := CompileTinyGo("./testdata/tinygo_timer")
+	if err != nil {
+		t.Fatalf("CompileTinyGo failed: %v", err)
+	}
+
+	inst, err := NewInstance(wasmBytes)
+	if err != nil {
+		t.Fatalf("NewInstance failed: %v", err)
+	}
+
+	done := inst.Get("TimerDone")
+	if done == nil || done != true {
+		t.Fatalf("TimerDone = %v, want true", done)
+	}
+
+	elapsed := inst.Get("TimerElapsedMs")
+	if elapsed == nil {
+		t.Fatal("TimerElapsedMs not set")
+	}
+	ms, ok := elapsed.(float64)
+	if !ok {
+		t.Fatalf("TimerElapsedMs is %T, want float64", elapsed)
+	}
+	if ms < 40 {
+		t.Fatalf("TimerElapsedMs = %v, want >= 40 (slept 50ms)", ms)
+	}
+	t.Logf("TinyGo timer test: elapsed=%vms", ms)
+}
+
 func TestFetchAPI(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go compiler not found in PATH")
