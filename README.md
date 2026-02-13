@@ -29,9 +29,9 @@ inst, _ := gigwasm.NewInstance(wasmBytes, gigwasm.WithFetchClient(myClient))
 // Pass command-line arguments
 inst, _ := gigwasm.NewInstance(wasmBytes, gigwasm.WithArgs([]string{"app", "--flag"}))
 
-// Add host-side SQLite
+// Add host-side database support (backed by SQLite, or any database/sql driver)
 inst, _ := gigwasm.NewInstance(wasmBytes,
-    gigwasm.WithImportNamespace(gigwasm.SQLiteNamespace()),
+    gigwasm.WithImportNamespace(gigwasm.WasmSQLNamespace("sqlite")),
 )
 ```
 
@@ -157,22 +157,26 @@ Installs a synchronous implementation of the WHATWG Fetch API, enabling `net/htt
 
 Limitations: All requests are synchronous. No streaming. No `AbortController`.
 
-#### SQLite Host (`SQLiteNamespace`)
+#### Database Host (`WasmSQLNamespace`)
 
-Provides a `sqlite3` import namespace backed by `modernc.org/sqlite`, paired with a guest-side `database/sql` driver in `wasmsql/`.
+Provides a `wasmsql` import namespace — a 6-function streaming database passthrough using binary TLV on the wire. Any `database/sql` backend works on the host side; the guest doesn't know or care what's behind the pipe. Paired with a guest-side `database/sql` driver in `wasmsql/` (driver name `"wasmsql"`).
 
-| Operation | Status |
+```go
+inst, _ := gigwasm.NewInstance(wasmBytes,
+    gigwasm.WithImportNamespace(gigwasm.WasmSQLNamespace("sqlite")),
+)
+```
+
+| Function | Description |
 |---|---|
-| `open` / `close` | Supported |
-| `prepare` / `finalize` / `reset` | Supported |
-| `bind_text` / `bind_int64` / `bind_double` / `bind_null` | Supported |
-| `step` | Supported (auto-detects SELECT vs exec) |
-| `column_count` / `column_type` / `column_name` | Supported |
-| `column_text` / `column_int64` / `column_double` | Supported |
-| `last_insert_rowid` / `changes` | Supported |
-| `errmsg` | Supported |
-| `bind_blob` | Not yet implemented |
-| `column_blob` | Not yet implemented (text fallback works for most cases) |
+| `open(path, pathLen)` | Opens a database connection via `sql.Open(driverName, dsn)` |
+| `close(db)` | Closes database and any open result sets |
+| `exec(db, sql, sqlLen, params, paramsLen, result, resultLen)` | Executes non-row-returning statements; returns last insert ID + rows affected |
+| `query(db, sql, sqlLen, params, paramsLen, result, resultLen)` | Executes row-returning statements; returns a result handle + column metadata |
+| `next(handle, row, rowLen)` | Streams the next row from a result handle |
+| `close_rows(handle)` | Closes a result handle, frees host-side resources |
+
+Parameters and results use a binary TLV (type-length-value) wire format with little-endian byte order. Supported types: null, int64, float64, text, blob, bool.
 
 ## What Works Well
 
@@ -184,7 +188,7 @@ Provides a `sqlite3` import namespace backed by `modernc.org/sqlite`, paired wit
 - **`time.Sleep`**, **`time.After`**, and goroutine scheduling across timer callbacks (both standard Go and TinyGo)
 - **`setTimeout`** / **`setInterval`** via `syscall/js`
 - **`net/http`** client requests (with `WithFetch()`)
-- **`database/sql`** with SQLite (with `SQLiteNamespace()` + `wasmsql` driver)
+- **`database/sql`** with any backend (with `WasmSQLNamespace(driverName)` + `wasmsql` guest driver)
 
 ## Known Limitations
 

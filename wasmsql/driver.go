@@ -1,8 +1,18 @@
 //go:build js && wasm
 
-// Package wasmsql provides a database/sql driver for SQLite that works inside
-// WASM by calling host-provided SQLite C API functions via //go:wasmimport.
-// It registers itself as the "sqlite" driver (matching modernc.org/sqlite).
+// Package wasmsql provides a database/sql driver that works inside WASM by
+// calling host-provided database operations via //go:wasmimport. The host
+// implements the "wasmsql" namespace — a 6-function streaming database
+// passthrough using binary TLV on the wire. Any SQL backend works on the
+// host side; the guest doesn't know or care what's behind the pipe.
+//
+// Register this driver with a blank import:
+//
+//	import _ "nickandperla.net/gigwasm/wasmsql"
+//
+// Then use database/sql as usual:
+//
+//	db, _ := sql.Open("sqlite", "/path/to/db")
 package wasmsql
 
 import (
@@ -10,91 +20,194 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
-	"strconv"
+	"math"
 	"unsafe"
 )
 
 func init() {
-	sql.Register("sqlite", &Driver{})
+	sql.Register("wasmsql", &Driver{})
 }
 
-// --- wasmimport declarations ---
-// These call into the host "sqlite3" namespace.
+// --- wasmimport declarations (6 functions in "wasmsql" namespace) ---
 
-//go:wasmimport sqlite3 open
+//go:wasmimport wasmsql open
 func hostOpen(pathPtr unsafe.Pointer, pathLen int32) int32
 
-//go:wasmimport sqlite3 close
+//go:wasmimport wasmsql close
 func hostClose(db int32) int32
 
-//go:wasmimport sqlite3 errmsg
-func hostErrmsg(db int32, bufPtr unsafe.Pointer, bufLen int32) int32
+//go:wasmimport wasmsql exec
+func hostExec(db int32, sqlPtr unsafe.Pointer, sqlLen int32,
+	paramsPtr unsafe.Pointer, paramsLen int32,
+	resultPtr unsafe.Pointer, resultLen int32) int32
 
-//go:wasmimport sqlite3 prepare
-func hostPrepare(db int32, sqlPtr unsafe.Pointer, sqlLen int32) int32
+//go:wasmimport wasmsql query
+func hostQuery(db int32, sqlPtr unsafe.Pointer, sqlLen int32,
+	paramsPtr unsafe.Pointer, paramsLen int32,
+	resultPtr unsafe.Pointer, resultLen int32) int32
 
-//go:wasmimport sqlite3 finalize
-func hostFinalize(stmt int32) int32
+//go:wasmimport wasmsql next
+func hostNext(handle int32, rowPtr unsafe.Pointer, rowLen int32) int32
 
-//go:wasmimport sqlite3 reset
-func hostReset(stmt int32) int32
+//go:wasmimport wasmsql close_rows
+func hostCloseRows(handle int32) int32
 
-//go:wasmimport sqlite3 bind_text
-func hostBindText(stmt int32, idx int32, ptr unsafe.Pointer, length int32) int32
+// --- TLV type bytes ---
 
-//go:wasmimport sqlite3 bind_int64
-func hostBindInt64(stmt int32, idx int32, val int64) int32
-
-//go:wasmimport sqlite3 bind_double
-func hostBindDouble(stmt int32, idx int32, val float64) int32
-
-//go:wasmimport sqlite3 bind_null
-func hostBindNull(stmt int32, idx int32) int32
-
-//go:wasmimport sqlite3 step
-func hostStep(stmt int32) int32
-
-//go:wasmimport sqlite3 column_count
-func hostColumnCount(stmt int32) int32
-
-//go:wasmimport sqlite3 column_type
-func hostColumnType(stmt int32, col int32) int32
-
-//go:wasmimport sqlite3 column_text
-func hostColumnText(stmt int32, col int32, bufPtr unsafe.Pointer, bufLen int32) int32
-
-//go:wasmimport sqlite3 column_int64
-func hostColumnInt64(stmt int32, col int32) int64
-
-//go:wasmimport sqlite3 column_double
-func hostColumnDouble(stmt int32, col int32) float64
-
-//go:wasmimport sqlite3 column_name
-func hostColumnName(stmt int32, col int32, bufPtr unsafe.Pointer, bufLen int32) int32
-
-//go:wasmimport sqlite3 last_insert_rowid
-func hostLastInsertRowid(db int32) int64
-
-//go:wasmimport sqlite3 changes
-func hostChanges(db int32) int32
-
-// SQLite result codes
 const (
-	sqliteOK   = 0
-	sqliteRow  = 100
-	sqliteDone = 101
-
-	sqliteInteger = 1
-	sqliteFloat   = 2
-	sqliteText    = 3
-	sqliteBlob    = 4
-	sqliteNull    = 5
+	tlvNull    = 0x00
+	tlvInt64   = 0x01
+	tlvFloat64 = 0x02
+	tlvText    = 0x03
+	tlvBlob    = 0x04
+	tlvBool    = 0x05
 )
 
-func getErrmsg(db int32) string {
-	buf := make([]byte, 512)
-	n := hostErrmsg(db, unsafe.Pointer(&buf[0]), int32(len(buf)))
-	return string(buf[:n])
+// --- Little-endian helpers (raw byte manipulation, no imports) ---
+
+func leU32(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+
+func leI64(b []byte) int64 {
+	return int64(leU32(b)) | int64(leU32(b[4:]))<<32
+}
+
+func leF64(b []byte) float64 {
+	return math.Float64frombits(uint64(leU32(b)) | uint64(leU32(b[4:]))<<32)
+}
+
+func putU32(b []byte, v uint32) {
+	b[0] = byte(v)
+	b[1] = byte(v >> 8)
+	b[2] = byte(v >> 16)
+	b[3] = byte(v >> 24)
+}
+
+func putI64(b []byte, v int64) {
+	putU32(b, uint32(v))
+	putU32(b[4:], uint32(v>>32))
+}
+
+func putF64(b []byte, v float64) {
+	bits := math.Float64bits(v)
+	putU32(b, uint32(bits))
+	putU32(b[4:], uint32(bits>>32))
+}
+
+// --- TLV encoding (guest → host: params) ---
+
+func encodeParams(args []driver.Value) []byte {
+	if len(args) == 0 {
+		return []byte{0, 0, 0, 0} // count = 0
+	}
+	// Estimate capacity: 4 (count) + ~10 bytes per param
+	buf := make([]byte, 4, 4+len(args)*10)
+	putU32(buf, uint32(len(args)))
+
+	for _, arg := range args {
+		switch v := arg.(type) {
+		case nil:
+			buf = append(buf, tlvNull)
+		case int64:
+			buf = append(buf, tlvInt64, 0, 0, 0, 0, 0, 0, 0, 0)
+			putI64(buf[len(buf)-8:], v)
+		case float64:
+			buf = append(buf, tlvFloat64, 0, 0, 0, 0, 0, 0, 0, 0)
+			putF64(buf[len(buf)-8:], v)
+		case string:
+			b := []byte(v)
+			buf = append(buf, tlvText, 0, 0, 0, 0)
+			putU32(buf[len(buf)-4:], uint32(len(b)))
+			buf = append(buf, b...)
+		case []byte:
+			buf = append(buf, tlvBlob, 0, 0, 0, 0)
+			putU32(buf[len(buf)-4:], uint32(len(v)))
+			buf = append(buf, v...)
+		case bool:
+			buf = append(buf, tlvBool)
+			if v {
+				buf = append(buf, 1)
+			} else {
+				buf = append(buf, 0)
+			}
+		default:
+			// Convert to string
+			s := fmt.Sprintf("%v", v)
+			b := []byte(s)
+			buf = append(buf, tlvText, 0, 0, 0, 0)
+			putU32(buf[len(buf)-4:], uint32(len(b)))
+			buf = append(buf, b...)
+		}
+	}
+	return buf
+}
+
+// --- TLV decoding (host → guest: results) ---
+
+func decodeExecResult(b []byte) (lastInsertID, rowsAffected int64) {
+	if len(b) < 16 {
+		return 0, 0
+	}
+	return leI64(b[0:]), leI64(b[8:])
+}
+
+func decodeQueryHeader(b []byte) (handle int32, cols []string) {
+	if len(b) < 8 {
+		return 0, nil
+	}
+	handle = int32(leU32(b[0:]))
+	numCols := leU32(b[4:])
+	pos := 8
+	cols = make([]string, numCols)
+	for i := uint32(0); i < numCols; i++ {
+		if pos+4 > len(b) {
+			break
+		}
+		n := leU32(b[pos:])
+		pos += 4
+		if pos+int(n) > len(b) {
+			break
+		}
+		cols[i] = string(b[pos : pos+int(n)])
+		pos += int(n)
+	}
+	return handle, cols
+}
+
+func decodeRow(b []byte, numCols int, dest []driver.Value) {
+	pos := 0
+	for i := 0; i < numCols && pos < len(b); i++ {
+		typ := b[pos]
+		pos++
+		switch typ {
+		case tlvNull:
+			dest[i] = nil
+		case tlvInt64:
+			dest[i] = leI64(b[pos:])
+			pos += 8
+		case tlvFloat64:
+			dest[i] = leF64(b[pos:])
+			pos += 8
+		case tlvText:
+			n := leU32(b[pos:])
+			pos += 4
+			dest[i] = string(b[pos : pos+int(n)])
+			pos += int(n)
+		case tlvBlob:
+			n := leU32(b[pos:])
+			pos += 4
+			blob := make([]byte, n)
+			copy(blob, b[pos:pos+int(n)])
+			pos += int(n)
+			dest[i] = blob
+		case tlvBool:
+			dest[i] = b[pos] != 0
+			pos++
+		default:
+			dest[i] = nil
+		}
+	}
 }
 
 // --- Driver ---
@@ -117,37 +230,28 @@ type Conn struct {
 }
 
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
-	qBytes := []byte(query)
-	handle := hostPrepare(c.db, unsafe.Pointer(&qBytes[0]), int32(len(qBytes)))
-	if handle == 0 {
-		return nil, fmt.Errorf("wasmsql: prepare failed: %s", getErrmsg(c.db))
-	}
-	return &Stmt{conn: c, handle: handle, query: query}, nil
+	return &Stmt{conn: c, query: query}, nil
 }
 
 func (c *Conn) Close() error {
 	rc := hostClose(c.db)
-	if rc != sqliteOK {
+	if rc != 0 {
 		return fmt.Errorf("wasmsql: close failed")
 	}
 	return nil
 }
 
 func (c *Conn) Begin() (driver.Tx, error) {
-	_, err := c.execDirect("BEGIN")
-	if err != nil {
+	if err := c.execDirect("BEGIN"); err != nil {
 		return nil, err
 	}
 	return &Tx{conn: c}, nil
 }
 
-func (c *Conn) execDirect(query string) (driver.Result, error) {
-	stmt, err := c.Prepare(query)
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	return stmt.Exec(nil)
+func (c *Conn) execDirect(query string) error {
+	stmt := &Stmt{conn: c, query: query}
+	_, err := stmt.Exec(nil)
+	return err
 }
 
 // --- Tx ---
@@ -157,142 +261,112 @@ type Tx struct {
 }
 
 func (tx *Tx) Commit() error {
-	_, err := tx.conn.execDirect("COMMIT")
-	return err
+	return tx.conn.execDirect("COMMIT")
 }
 
 func (tx *Tx) Rollback() error {
-	_, err := tx.conn.execDirect("ROLLBACK")
-	return err
+	return tx.conn.execDirect("ROLLBACK")
 }
 
 // --- Stmt ---
 
 type Stmt struct {
-	conn   *Conn
-	handle int32
-	query  string
+	conn  *Conn
+	query string
 }
 
 func (s *Stmt) Close() error {
-	rc := hostFinalize(s.handle)
-	if rc != sqliteOK {
-		return fmt.Errorf("wasmsql: finalize failed")
-	}
-	return nil
+	return nil // no-op: no host-side handle
 }
 
 func (s *Stmt) NumInput() int {
-	return -1 // variable number of inputs
-}
-
-func (s *Stmt) bindArgs(args []driver.Value) error {
-	for i, arg := range args {
-		idx := int32(i + 1) // 1-based
-		switch v := arg.(type) {
-		case nil:
-			if rc := hostBindNull(s.handle, idx); rc != sqliteOK {
-				return fmt.Errorf("wasmsql: bind_null failed")
-			}
-		case int64:
-			if rc := hostBindInt64(s.handle, idx, v); rc != sqliteOK {
-				return fmt.Errorf("wasmsql: bind_int64 failed")
-			}
-		case float64:
-			if rc := hostBindDouble(s.handle, idx, v); rc != sqliteOK {
-				return fmt.Errorf("wasmsql: bind_double failed")
-			}
-		case bool:
-			var iv int64
-			if v {
-				iv = 1
-			}
-			if rc := hostBindInt64(s.handle, idx, iv); rc != sqliteOK {
-				return fmt.Errorf("wasmsql: bind_int64 (bool) failed")
-			}
-		case string:
-			b := []byte(v)
-			var ptr unsafe.Pointer
-			if len(b) > 0 {
-				ptr = unsafe.Pointer(&b[0])
-			} else {
-				// Empty string: pass a non-nil pointer to avoid issues
-				var zero byte
-				ptr = unsafe.Pointer(&zero)
-			}
-			if rc := hostBindText(s.handle, idx, ptr, int32(len(b))); rc != sqliteOK {
-				return fmt.Errorf("wasmsql: bind_text failed")
-			}
-		case []byte:
-			// Bind as text (SQLite treats TEXT and BLOB similarly for many uses)
-			var ptr unsafe.Pointer
-			if len(v) > 0 {
-				ptr = unsafe.Pointer(&v[0])
-			} else {
-				var zero byte
-				ptr = unsafe.Pointer(&zero)
-			}
-			if rc := hostBindText(s.handle, idx, ptr, int32(len(v))); rc != sqliteOK {
-				return fmt.Errorf("wasmsql: bind_text (bytes) failed")
-			}
-		default:
-			// Convert to string
-			str := fmt.Sprintf("%v", v)
-			b := []byte(str)
-			if rc := hostBindText(s.handle, idx, unsafe.Pointer(&b[0]), int32(len(b))); rc != sqliteOK {
-				return fmt.Errorf("wasmsql: bind_text (default) failed")
-			}
-		}
-	}
-	return nil
+	return -1 // variable
 }
 
 func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
-	hostReset(s.handle)
+	sqlBytes := []byte(s.query)
+	paramBytes := encodeParams(args)
 
-	if err := s.bindArgs(args); err != nil {
-		return nil, err
+	var sqlPtr unsafe.Pointer
+	if len(sqlBytes) > 0 {
+		sqlPtr = unsafe.Pointer(&sqlBytes[0])
+	}
+	var paramsPtr unsafe.Pointer
+	var paramsLen int32
+	if len(paramBytes) > 0 {
+		paramsPtr = unsafe.Pointer(&paramBytes[0])
+		paramsLen = int32(len(paramBytes))
 	}
 
-	rc := hostStep(s.handle)
-	if rc != sqliteDone && rc != sqliteRow {
-		return nil, fmt.Errorf("wasmsql: exec step failed: %s", getErrmsg(s.conn.db))
-	}
+	buf := make([]byte, 64)
+	n := hostExec(s.conn.db,
+		sqlPtr, int32(len(sqlBytes)),
+		paramsPtr, paramsLen,
+		unsafe.Pointer(&buf[0]), int32(len(buf)),
+	)
 
-	// Drain any remaining rows
-	for rc == sqliteRow {
-		rc = hostStep(s.handle)
+	if n >= 0 {
+		lastID, affected := decodeExecResult(buf[:n])
+		return &Result{lastID: lastID, changes: affected}, nil
 	}
-
-	rowid := hostLastInsertRowid(s.conn.db)
-	changes := int64(hostChanges(s.conn.db))
-	return &Result{lastID: rowid, changes: changes}, nil
+	if n <= -2 {
+		errLen := int(-n) - 2
+		if errLen > len(buf) {
+			errLen = len(buf)
+		}
+		return nil, fmt.Errorf("wasmsql: %s", string(buf[:errLen]))
+	}
+	// n == -1: buffer too small (shouldn't happen for exec, result is 16 bytes)
+	return nil, fmt.Errorf("wasmsql: exec result buffer too small")
 }
 
 func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
-	hostReset(s.handle)
+	sqlBytes := []byte(s.query)
+	paramBytes := encodeParams(args)
 
-	if err := s.bindArgs(args); err != nil {
-		return nil, err
+	var sqlPtr unsafe.Pointer
+	if len(sqlBytes) > 0 {
+		sqlPtr = unsafe.Pointer(&sqlBytes[0])
+	}
+	var paramsPtr unsafe.Pointer
+	var paramsLen int32
+	if len(paramBytes) > 0 {
+		paramsPtr = unsafe.Pointer(&paramBytes[0])
+		paramsLen = int32(len(paramBytes))
 	}
 
-	// Step first to trigger query execution on the host, which
-	// populates column metadata. Before this, column_count returns 0.
-	rc := hostStep(s.handle)
-	if rc != sqliteRow && rc != sqliteDone {
-		return nil, fmt.Errorf("wasmsql: query step failed: %s", getErrmsg(s.conn.db))
-	}
+	bufSize := 4096
+	for attempts := 0; attempts < 2; attempts++ {
+		buf := make([]byte, bufSize)
+		n := hostQuery(s.conn.db,
+			sqlPtr, int32(len(sqlBytes)),
+			paramsPtr, paramsLen,
+			unsafe.Pointer(&buf[0]), int32(len(buf)),
+		)
 
-	numCols := hostColumnCount(s.handle)
-	cols := make([]string, numCols)
-	buf := make([]byte, 256)
-	for i := int32(0); i < numCols; i++ {
-		n := hostColumnName(s.handle, i, unsafe.Pointer(&buf[0]), int32(len(buf)))
-		cols[i] = string(buf[:n])
+		if n >= 0 {
+			handle, cols := decodeQueryHeader(buf[:n])
+			return &Rows{
+				conn:    s.conn,
+				handle:  handle,
+				cols:    cols,
+				numCols: len(cols),
+				buf:     make([]byte, 4096),
+			}, nil
+		}
+		if n == -1 {
+			required := leU32(buf[0:4])
+			bufSize = int(required) + 64
+			continue
+		}
+		// Error
+		errLen := int(-n) - 2
+		if errLen > len(buf) {
+			errLen = len(buf)
+		}
+		return nil, fmt.Errorf("wasmsql: %s", string(buf[:errLen]))
 	}
-
-	done := rc == sqliteDone
-	return &Rows{stmt: s, cols: cols, numCols: numCols, done: done, firstStep: rc}, nil
+	return nil, fmt.Errorf("wasmsql: query header buffer retry exhausted")
 }
 
 // --- Result ---
@@ -313,11 +387,11 @@ func (r *Result) RowsAffected() (int64, error) {
 // --- Rows ---
 
 type Rows struct {
-	stmt      *Stmt
-	cols      []string
-	numCols   int32
-	done      bool
-	firstStep int32 // buffered step result from Query(); -1 = consumed
+	conn    *Conn
+	handle  int32    // result handle from query()
+	cols    []string // column names
+	numCols int
+	buf     []byte // reusable row buffer, grows as needed
 }
 
 func (r *Rows) Columns() []string {
@@ -325,62 +399,33 @@ func (r *Rows) Columns() []string {
 }
 
 func (r *Rows) Close() error {
-	// Don't finalize — the Stmt.Close() handles that.
-	// Just drain remaining rows.
-	for !r.done {
-		rc := hostStep(r.stmt.handle)
-		if rc != sqliteRow {
-			r.done = true
-		}
-	}
+	hostCloseRows(r.handle)
 	return nil
 }
 
 func (r *Rows) Next(dest []driver.Value) error {
-	if r.done {
-		return io.EOF
-	}
+	for attempts := 0; attempts < 2; attempts++ {
+		n := hostNext(r.handle, unsafe.Pointer(&r.buf[0]), int32(len(r.buf)))
 
-	var rc int32
-	if r.firstStep >= 0 {
-		rc = r.firstStep
-		r.firstStep = -1
-	} else {
-		rc = hostStep(r.stmt.handle)
-	}
-
-	if rc == sqliteDone {
-		r.done = true
-		return io.EOF
-	}
-	if rc != sqliteRow {
-		return fmt.Errorf("wasmsql: step failed: %s", getErrmsg(r.stmt.conn.db))
-	}
-
-	buf := make([]byte, 4096)
-	for i := int32(0); i < r.numCols; i++ {
-		colType := hostColumnType(r.stmt.handle, i)
-		switch colType {
-		case sqliteNull:
-			dest[i] = nil
-		case sqliteInteger:
-			dest[i] = hostColumnInt64(r.stmt.handle, i)
-		case sqliteFloat:
-			dest[i] = hostColumnDouble(r.stmt.handle, i)
-		case sqliteText, sqliteBlob:
-			n := hostColumnText(r.stmt.handle, i, unsafe.Pointer(&buf[0]), int32(len(buf)))
-			dest[i] = string(buf[:n])
-		default:
-			n := hostColumnText(r.stmt.handle, i, unsafe.Pointer(&buf[0]), int32(len(buf)))
-			s := string(buf[:n])
-			// Try to parse as int64
-			if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-				dest[i] = v
-			} else {
-				dest[i] = s
-			}
+		if n > 0 {
+			decodeRow(r.buf[:n], r.numCols, dest)
+			return nil
 		}
+		if n == 0 {
+			return io.EOF
+		}
+		if n == -1 {
+			// Buffer too small; grow
+			required := leU32(r.buf[0:4])
+			r.buf = make([]byte, int(required)+64)
+			continue
+		}
+		// Error
+		errLen := int(-n) - 2
+		if errLen > len(r.buf) {
+			errLen = len(r.buf)
+		}
+		return fmt.Errorf("wasmsql: %s", string(r.buf[:errLen]))
 	}
-
-	return nil
+	return fmt.Errorf("wasmsql: row buffer retry exhausted")
 }

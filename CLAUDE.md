@@ -32,11 +32,23 @@ gigwasm is a Go library that runs Go-compiled WASM modules outside the browser u
 ### Host features (InstanceOption pattern)
 
 - **`fetchhost.go`** — `WithFetch()` / `WithFetchClient()` installs a synchronous Fetch API (fetch, Headers, Promise, ReadableStream) in the global object, enabling `net/http` in standard-Go WASM modules.
-- **`sqlitehost.go`** — `SQLiteNamespace()` returns a `NamespaceProvider` that registers a `sqlite3` import namespace backed by `modernc.org/sqlite`. Provides prepare/step/bind/column functions matching the SQLite C API pattern.
+- **`wasmsqlhost.go`** — `WasmSQLNamespace(driverName string)` returns a `NamespaceProvider` that registers a `wasmsql` import namespace — a streaming database passthrough (virtio for databases). The `driverName` selects the `database/sql` backend (e.g., `"sqlite"` for `modernc.org/sqlite`). Any SQL database works; the guest doesn't know or care what's behind the pipe.
+
+### wasmsql protocol (`wasmsql` namespace)
+
+6 functions using binary TLV on the wire (little-endian):
+
+- **`open`** / **`close`** — open/close a database via `sql.Open(driverName, dsn)`
+- **`exec`** — execute non-row-returning SQL (INSERT/UPDATE/DELETE/DDL). Params as TLV, returns `[lastInsertId: i64][rowsAffected: i64]`.
+- **`query`** — execute row-returning SQL. Returns a query header with a result handle and column names.
+- **`next`** — read the next row from a result handle. Returns one row as TLV values, 0 for EOF. Supports buffer-too-small retry (return -1, required size at buf[0:4]).
+- **`close_rows`** — close a result handle and free host resources.
+
+TLV type bytes: `0x00`=null, `0x01`=int64, `0x02`=float64, `0x03`=text, `0x04`=blob, `0x05`=bool. Error convention: return `-(errLen+2)`, UTF-8 message in result buffer.
 
 ### Guest-side SQL driver (`wasmsql/driver.go`)
 
-A `database/sql` driver meant to be compiled *into* the WASM module (build tag `js && wasm`). Uses `//go:wasmimport sqlite3 ...` to call host functions from `SQLiteNamespace()`. Registers as driver name `"sqlite"`.
+A `database/sql` driver compiled *into* the WASM module (build tag `js && wasm`). Uses `//go:wasmimport wasmsql ...` to call the 6 host functions. Registers as driver name `"wasmsql"`. Stateless prepared statements (just stores query string), streaming `Rows` with reusable row buffer. Zero binary size impact — no `encoding/json`, only raw byte manipulation + `math`.
 
 ### Extension pattern
 
