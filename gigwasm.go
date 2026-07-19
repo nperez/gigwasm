@@ -520,6 +520,17 @@ func (d *GoInstance) initValues() {
 			"Object": func([]interface{}) interface{} {
 				return map[string]interface{}{}
 			},
+			// Minimal Date: Go's time.initLocal (GOOS=js) determines the
+			// local timezone via `new Date().getTimezoneOffset()`. Backed by
+			// the host's zone so local time inside the module matches the host.
+			"Date": func([]interface{}) interface{} {
+				return map[string]interface{}{
+					"getTimezoneOffset": func([]interface{}) interface{} {
+						_, offsetSec := time.Now().Zone()
+						return float64(-offsetSec / 60)
+					},
+				}
+			},
 			"Array": func([]interface{}) interface{} {
 				return []interface{}{}
 			},
