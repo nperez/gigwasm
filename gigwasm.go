@@ -75,6 +75,8 @@ type timerEntry struct {
 // GoInstance is instance of Go Runtime.
 type GoInstance struct {
 	inst        *wasmer.Instance
+	module      *wasmer.Module
+	store       *wasmer.Store
 	mem         *wasmer.Memory
 	getsp       wasmer.NativeFunction // standard Go only
 	resume      wasmer.NativeFunction
@@ -90,6 +92,28 @@ type GoInstance struct {
 	nextTimerID     int32
 	scheduledTimers map[int32]*timerEntry
 	timerCh         chan int32
+}
+
+// Close releases the native resources held by the instance: the wasmer
+// instance, module, and store. Without an explicit Close, wasmer-go reclaims
+// native memory only through Go finalizers, which rarely run in programs
+// with small Go heaps — sequentially created instances then accumulate
+// gigabytes of native memory. The engine has no Close in wasmer-go and is
+// still reclaimed by its finalizer, but it is small once its store is gone.
+func (d *GoInstance) Close() {
+	d.cancelAllTimers()
+	if d.inst != nil {
+		d.inst.Close()
+		d.inst = nil
+	}
+	if d.module != nil {
+		d.module.Close()
+		d.module = nil
+	}
+	if d.store != nil {
+		d.store.Close()
+		d.store = nil
+	}
 }
 
 // Get returns a Go value specified by name from the global object.
@@ -1019,6 +1043,8 @@ func newInstanceFromModule(store *wasmer.Store, module *wasmer.Module, abi ABI, 
 		return nil, fmt.Errorf("failed to instantiate module: %w", err)
 	}
 	data.inst = instance
+	data.module = module
+	data.store = store
 
 	switch data.abi {
 	case ABIStdGo:
